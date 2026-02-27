@@ -1,0 +1,13 @@
+manifestVersion: 1
+name: "@keeb/prometheus"
+version: "2026.02.27.1"
+description: "Monitoring agent install/config + Prometheus target registration"
+models:
+  - monitoring_agent.ts
+  - monitoring_hub.ts
+workflows:
+  - setup-monitoring/workflow.yaml
+  - configure-monitoring/workflow.yaml
+  - setup-game-metrics/workflow.yaml
+dependencies:
+  - "@keeb/ssh"
