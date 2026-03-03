@@ -1,7 +1,13 @@
 manifestVersion: 1
 name: "@keeb/prometheus"
-version: "2026.02.27.1"
+version: "2026.03.02.2"
 description: "Monitoring agent install/config + Prometheus target registration (https://github.com/keeb/swamp-prometheus)"
+repository: https://github.com/keeb/swamp-prometheus
+tags:
+  - prometheus
+  - monitoring
+  - metrics
+  - observability
 models:
   - monitoring_agent.ts
   - monitoring_hub.ts
