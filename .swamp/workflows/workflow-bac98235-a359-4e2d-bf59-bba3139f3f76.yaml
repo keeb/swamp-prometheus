@@ -1,5 +1,5 @@
 id: bac98235-a359-4e2d-bf59-bba3139f3f76
-name: setup-monitoring
+name: '@keeb/setup-monitoring'
 description: Full monitoring setup — install agents + configure wiring + register with Prometheus
 inputs:
   vmName:

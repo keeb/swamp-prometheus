@@ -1,5 +1,5 @@
 id: bcc556d9-fce6-49e7-bc65-e5049000a4f6
-name: configure-monitoring
+name: '@keeb/configure-monitoring'
 description: Configure monitoring wiring (promtail → Loki, Prometheus target registration)
 inputs:
   vmName:

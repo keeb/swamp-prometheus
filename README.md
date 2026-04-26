@@ -45,6 +45,42 @@ Register monitoring targets with a Prometheus server.
 swamp extension pull @keeb/prometheus
 ```
 
+## Example
+
+Install node_exporter + promtail on an Alpine VM, then register it as a scrape target:
+
+```yaml
+models:
+  - name: agent
+    type: "@keeb/monitoring/agent"
+    globalArguments:
+      sshHost: "10.0.0.42"
+      sshUser: "root"
+  - name: hub
+    type: "@keeb/monitoring/hub"
+    globalArguments:
+      sshHost: "hancock.local"
+      sshUser: "keeb"
+      targetsDir: "/etc/prometheus/targets"
+
+jobs:
+  - name: onboard-vm
+    steps:
+      - model: agent
+        method: install
+        inputs: { vmName: "web01" }
+      - model: agent
+        method: configure
+        inputs:
+          vmName: "web01"
+          lokiUrl: "http://hancock.local:3100/loki/api/v1/push"
+      - model: hub
+        method: register
+        inputs:
+          vmName: "web01"
+          targetIp: "10.0.0.42"
+```
+
 ## License
 
 MIT
