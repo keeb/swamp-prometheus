@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@keeb/prometheus"
-version: "2026.04.26.1"
+version: "2026.10.15.1"
 description: "Monitoring agent install/config + Prometheus target registration (https://github.com/keeb/swamp-prometheus)"
 repository: https://github.com/keeb/swamp-prometheus
 additionalFiles:
@@ -16,9 +16,9 @@ models:
   - monitoring_agent.ts
   - monitoring_hub.ts
 workflows:
-  - setup-monitoring/workflow.yaml
-  - configure-monitoring/workflow.yaml
-  - setup-game-metrics/workflow.yaml
+  - workflow-bac98235-a359-4e2d-bf59-bba3139f3f76.yaml
+  - workflow-bcc556d9-fce6-49e7-bc65-e5049000a4f6.yaml
+  - workflow-31fbed74-d3be-431c-b924-864febc11e54.yaml
 skills:
   - prometheus
 dependencies:
