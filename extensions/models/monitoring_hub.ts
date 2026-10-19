@@ -3,13 +3,23 @@
  * (Loki, Prometheus) on the monitoring hub host, register VMs as
  * Prometheus scrape targets via file_sd_configs, and edit/inspect the live
  * `prometheus.yml`.
+ *
+ * All remote work runs over SSH (see lib/ssh.ts). Paths are shell-quoted and
+ * every other interpolated value is validated by the argument schemas below.
  */
 import { z } from "npm:zod@4";
-import { sshExec, sshExecRaw } from "./lib/ssh.ts";
+import { assertSshTarget, sshExec, sshExecRaw } from "./lib/ssh.ts";
+import {
+  assertAbsPath,
+  JOB_NAME_RE,
+  shellQuote,
+  TARGET_HOST_RE,
+  VmName,
+} from "./lib/validate.ts";
 
 const GlobalArgs = z.object({
   sshHost: z.string().describe(
-    "SSH hostname/IP of the monitoring hub (hancock)",
+    "SSH hostname/IP of the monitoring hub",
   ),
   sshUser: z.string().default("keeb").describe("SSH user (default 'keeb')"),
   targetsDir: z.string().describe(
@@ -20,10 +30,13 @@ const GlobalArgs = z.object({
 const DiscoverArgs = z.object({});
 
 const RegisterArgs = z.object({
-  vmName: z.string().describe(
+  vmName: VmName.describe(
     "VM name to register as a Prometheus scrape target",
   ),
-  targetIp: z.string().describe("IP address of the target VM"),
+  targetIp: z.string().regex(
+    TARGET_HOST_RE,
+    "targetIp must be an IPv4 address, hostname, or [IPv6] literal",
+  ).describe("IP address of the target VM"),
 });
 
 const InspectArgs = z.object({});
@@ -31,7 +44,10 @@ const InspectArgs = z.object({});
 const ReloadArgs = z.object({});
 
 const RemoveScrapeJobArgs = z.object({
-  jobName: z.string().describe(
+  jobName: z.string().regex(
+    JOB_NAME_RE,
+    "jobName must be 1-128 letters, digits, '_', '.', ':' or '-'",
+  ).describe(
     "Name of the scrape_config job_name to remove from prometheus.yml",
   ),
 });
@@ -73,83 +89,292 @@ const TargetSchema = z.object({
   timestamp: z.string(),
 });
 
+type GlobalArgsT = z.infer<typeof GlobalArgs>;
+
+/** The subset of the swamp method context this model uses. */
+interface HubContext {
+  globalArgs: GlobalArgsT;
+  logger: {
+    info: (message: string, props?: Record<string, unknown>) => void;
+    warning: (message: string, props?: Record<string, unknown>) => void;
+  };
+  writeResource: (
+    spec: string,
+    name: string,
+    data: Record<string, unknown>,
+  ) => Promise<unknown>;
+}
+
+/** An active target as reported by Prometheus' /api/v1/targets. */
+export interface ActiveTarget {
+  job: string;
+  instance: string;
+  scrapePool: string;
+  health: string;
+}
+
+/** Resolves and validates the SSH target from global arguments. */
+function sshTarget(context: HubContext): { host: string; user: string } {
+  const { sshHost, sshUser = "keeb" } = context.globalArgs;
+  assertSshTarget(sshHost, sshUser);
+  return { host: sshHost, user: sshUser };
+}
+
+/** Parses a Prometheus HTTP API JSON response, throwing a descriptive error. */
+export function parsePromApi(label: string, stdout: string): unknown {
+  let body: unknown;
+  try {
+    body = JSON.parse(stdout);
+  } catch {
+    throw new Error(
+      `${label}: Prometheus returned non-JSON output: ${stdout.slice(0, 200)}`,
+    );
+  }
+  if (
+    typeof body !== "object" || body === null ||
+    (body as { status?: unknown }).status === "error"
+  ) {
+    throw new Error(
+      `${label}: Prometheus API error: ${JSON.stringify(body).slice(0, 300)}`,
+    );
+  }
+  return body;
+}
+
+/** Extracts active targets from a parsed /api/v1/targets response. */
+export function extractActiveTargets(body: unknown): ActiveTarget[] {
+  const raw = (body as { data?: { activeTargets?: unknown } })?.data
+    ?.activeTargets;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((t) => {
+    const s = (v: unknown) => (typeof v === "string" ? v : "");
+    const labels = (t?.labels ?? {}) as Record<string, unknown>;
+    return {
+      job: s(labels.job),
+      instance: s(labels.instance) || s(t?.scrapeUrl),
+      scrapePool: s(t?.scrapePool),
+      health: s(t?.health),
+    };
+  });
+}
+
+/** Builds the file_sd_configs JSON for a single node_exporter target. */
+export function targetFileJson(vmName: string, targetHost: string): string {
+  return JSON.stringify(
+    [
+      {
+        targets: [`${targetHost}:9100`],
+        labels: { instance: vmName, job: "node" },
+      },
+    ],
+    null,
+    2,
+  );
+}
+
+/**
+ * Removes every `- job_name: <jobName>` block from a prometheus.yml body.
+ * A block ends at the first non-blank, non-comment line whose indentation is
+ * at or left of the `- job_name` dash. Blank lines and comments at or left of
+ * that indentation that sit between the removed block and the next entry are
+ * kept (they usually describe the next entry); deeper comments are dropped
+ * with the block. Returns the new text and whether any block was removed.
+ */
+export function removeJobBlock(
+  yamlContent: string,
+  jobName: string,
+): { yaml: string; removed: boolean } {
+  const lines = yamlContent.split("\n");
+  const out: string[] = [];
+  let skipping = false;
+  let blockIndent = 0;
+  let removed = false;
+  let pending: string[] = [];
+  const escaped = jobName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const startRe = new RegExp(
+    `^(\\s*)-\\s+job_name:\\s*["']?${escaped}["']?\\s*(?:#.*)?$`,
+  );
+
+  for (const line of lines) {
+    if (skipping) {
+      const trimmed = line.trim();
+      const lstrip = line.length - line.trimStart().length;
+      if (trimmed === "") {
+        pending.push(line);
+        continue;
+      }
+      if (trimmed.startsWith("#")) {
+        if (lstrip <= blockIndent) pending.push(line);
+        continue;
+      }
+      if (lstrip > blockIndent) {
+        pending = [];
+        continue;
+      }
+      skipping = false;
+      out.push(...pending);
+      pending = [];
+    }
+    const m = line.match(startRe);
+    if (m) {
+      blockIndent = m[1].length;
+      skipping = true;
+      removed = true;
+      continue;
+    }
+    out.push(line);
+  }
+  // A block removed at EOF swallows the final newline; keep the file
+  // newline-terminated if it was.
+  if (removed && yamlContent.endsWith("\n") && out[out.length - 1] !== "") {
+    out.push("");
+  }
+  return { yaml: out.join("\n"), removed };
+}
+
+/** UTF-8 safe base64 encoding. */
+export function toBase64(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
 /** Swamp model definition for `@keeb/monitoring/hub`. */
-export const model: {
-  type: string;
-  version: string;
-  resources: Record<string, unknown>;
-  globalArguments: typeof GlobalArgs;
-  methods: Record<string, unknown>;
-} = {
+export const model = {
   type: "@keeb/monitoring/hub",
   version: "2026.04.26.1",
   resources: {
     "hub": {
-      description: "Observability stack endpoints on hancock",
+      description: "Observability stack endpoints on the monitoring hub",
       schema: HubSchema,
-      lifetime: "infinite",
+      lifetime: "infinite" as const,
       garbageCollection: 10,
     },
     "target": {
       description: "Prometheus scrape target registration",
       schema: TargetSchema,
-      lifetime: "infinite",
+      lifetime: "infinite" as const,
       garbageCollection: 10,
     },
     "inspect": {
       description: "Live Prometheus scrape config and active targets",
       schema: InspectSchema,
-      lifetime: "infinite",
+      lifetime: "infinite" as const,
       garbageCollection: 10,
     },
     "removeScrapeJob": {
       description:
         "Result of removing a scrape_config block from prometheus.yml",
       schema: RemoveScrapeJobSchema,
-      lifetime: "infinite",
+      lifetime: "infinite" as const,
       garbageCollection: 10,
     },
   },
   globalArguments: GlobalArgs,
+  upgrades: [
+    {
+      toVersion: "2026.04.26.1",
+      description: "Baseline version, no globalArguments schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
+  checks: {
+    "valid-hub-target": {
+      description:
+        "sshHost/sshUser are a plain hostname/IP and user name, and targetsDir is absolute",
+      labels: ["policy"],
+      execute: (
+        context: { globalArgs: GlobalArgsT },
+      ): Promise<{ pass: boolean; errors?: string[] }> => {
+        const { sshHost, sshUser = "keeb", targetsDir } = context.globalArgs;
+        const errors: string[] = [];
+        for (
+          const check of [
+            () => assertSshTarget(sshHost, sshUser),
+            () => assertAbsPath("targetsDir", targetsDir),
+          ]
+        ) {
+          try {
+            check();
+          } catch (e) {
+            errors.push((e as Error).message);
+          }
+        }
+        return Promise.resolve(
+          errors.length ? { pass: false, errors } : { pass: true },
+        );
+      },
+    },
+  },
   methods: {
     discover: {
       description: "Validate observability stack and write endpoint data",
       arguments: DiscoverArgs,
-      execute: async (_args, context) => {
-        const { sshHost, sshUser = "keeb", targetsDir } = context.globalArgs;
+      execute: async (
+        _args: z.infer<typeof DiscoverArgs>,
+        context: HubContext,
+      ) => {
+        const { host, user } = sshTarget(context);
+        const { targetsDir } = context.globalArgs;
+        const log = context.logger;
 
-        console.log(`[discover] Checking observability stack on ${sshHost}`);
+        log.info("Checking observability stack on {host}", { host });
 
-        // Check Loki readiness (exposed on host port 3100)
-        console.log(`[discover] Checking Loki...`);
+        // Loki readiness (exposed on host port 3100)
         const lokiResult = await sshExecRaw(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `curl -sf http://localhost:3100/ready`,
         );
-        const lokiReady = lokiResult.stdout.trim().toLowerCase() === "ready";
-        console.log(`[discover] Loki ready: ${lokiReady}`);
+        const lokiReady = lokiResult.code === 0 &&
+          lokiResult.stdout.trim().toLowerCase() === "ready";
 
-        // Check Prometheus readiness (not exposed on host, use docker exec)
-        console.log(`[discover] Checking Prometheus...`);
+        // Prometheus readiness (not exposed on host, use docker exec)
         const promResult = await sshExecRaw(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `docker exec prometheus wget -qO- http://localhost:9090/-/ready`,
         );
-        const prometheusReady = promResult.stdout.trim().includes("Ready");
-        console.log(`[discover] Prometheus ready: ${prometheusReady}`);
+        const prometheusReady = promResult.code === 0 &&
+          promResult.stdout.trim().includes("Ready");
 
-        const lokiPushUrl = `http://${sshHost}:3100/loki/api/v1/push`;
-        const prometheusUrl = `http://${sshHost}:9090`;
+        // Exit 255 is ssh's own failure (unreachable host, auth): that is not
+        // "service not ready", so fail instead of recording a false negative.
+        for (
+          const [name, r] of [["Loki", lokiResult], [
+            "Prometheus",
+            promResult,
+          ]] as const
+        ) {
+          if (r.code === 255) {
+            throw new Error(
+              `discover: SSH to ${user}@${host} failed while checking ${name}: ${
+                r.stderr.slice(-500)
+              }`,
+            );
+          }
+        }
 
-        console.log(`[discover] Loki push URL: ${lokiPushUrl}`);
-        console.log(`[discover] Prometheus URL: ${prometheusUrl}`);
+        if (!lokiReady) {
+          log.warning("Loki is not ready on {host}", { host });
+        }
+        if (!prometheusReady) {
+          log.warning("Prometheus is not ready on {host}", { host });
+        }
+
+        const lokiPushUrl = `http://${host}:3100/loki/api/v1/push`;
+        const prometheusUrl = `http://${host}:9090`;
+
+        log.info(
+          "Discovered hub: loki={lokiPushUrl} ready={lokiReady}, prometheus={prometheusUrl} ready={prometheusReady}",
+          { lokiPushUrl, lokiReady, prometheusUrl, prometheusReady },
+        );
 
         const handle = await context.writeResource("hub", "hub", {
           lokiPushUrl,
           prometheusUrl,
-          sshHost,
+          sshHost: host,
           targetsDir,
           lokiReady,
           prometheusReady,
@@ -162,37 +387,35 @@ export const model: {
       description:
         "Register a VM as a Prometheus scrape target via file_sd_configs",
       arguments: RegisterArgs,
-      execute: async (args, context) => {
-        const { vmName, targetIp } = args;
-        const { sshHost, sshUser = "keeb", targetsDir } = context.globalArgs;
+      execute: async (
+        args: z.infer<typeof RegisterArgs>,
+        context: HubContext,
+      ) => {
+        const { vmName, targetIp } = RegisterArgs.parse(args);
+        const { host, user } = sshTarget(context);
+        const targetsDir = assertAbsPath(
+          "targetsDir",
+          context.globalArgs.targetsDir,
+        ).replace(/\/+$/, "");
+        const log = context.logger;
 
-        console.log(
-          `[register] Registering ${vmName} (${targetIp}) as Prometheus target`,
-        );
+        log.info("Registering {vmName} ({targetIp}) as Prometheus target", {
+          vmName,
+          targetIp,
+        });
 
-        // Write file_sd_configs JSON target file
         const targetFile = `${targetsDir}/${vmName}.json`;
-        const targetConfig = JSON.stringify(
-          [
-            {
-              targets: [`${targetIp}:9100`],
-              labels: {
-                instance: vmName,
-                job: "node",
-              },
-            },
-          ],
-          null,
-          2,
-        );
+        const targetConfig = targetFileJson(vmName, targetIp);
 
         await sshExec(
-          sshHost,
-          sshUser,
-          `cat > ${targetFile} << 'EOF'\n${targetConfig}\nEOF`,
+          host,
+          user,
+          `cat > ${shellQuote(targetFile)} << 'EOF'\n${targetConfig}\nEOF`,
         );
-        console.log(`[register] Wrote target file: ${targetFile}`);
-        console.log(`[register] Prometheus will auto-discover within 15s`);
+        log.info(
+          "Wrote target file {targetFile}; Prometheus picks it up on its next file_sd refresh",
+          { targetFile },
+        );
 
         const handle = await context.writeResource("target", vmName, {
           success: true,
@@ -207,42 +430,44 @@ export const model: {
       description:
         "Inspect live Prometheus scrape config and active targets via the HTTP API",
       arguments: InspectArgs,
-      execute: async (_args, context) => {
-        const { sshHost, sshUser = "keeb" } = context.globalArgs;
+      execute: async (
+        _args: z.infer<typeof InspectArgs>,
+        context: HubContext,
+      ) => {
+        const { host, user } = sshTarget(context);
+        const log = context.logger;
 
-        console.log(`[inspect] Querying Prometheus on ${sshHost}`);
+        log.info("Querying Prometheus on {host}", { host });
 
-        const targetsResult = await sshExecRaw(
-          sshHost,
-          sshUser,
+        const targetsResult = await sshExec(
+          host,
+          user,
           `docker exec prometheus wget -qO- http://localhost:9090/api/v1/targets`,
         );
-        const targetsJson = JSON.parse(targetsResult.stdout);
-        const activeTargets = (targetsJson.data?.activeTargets || []).map(
-          (t) => ({
-            job: t.labels?.job || "",
-            instance: t.labels?.instance || t.scrapeUrl || "",
-            scrapePool: t.scrapePool || "",
-            health: t.health || "",
-          }),
+        const activeTargets = extractActiveTargets(
+          parsePromApi("inspect /api/v1/targets", targetsResult.stdout),
         );
 
         const jobs = Array.from(new Set(activeTargets.map((t) => t.job)))
           .sort();
-        console.log(`[inspect] Active jobs: ${JSON.stringify(jobs)}`);
-        for (const t of activeTargets) {
-          console.log(
-            `[inspect]   job=${t.job} pool=${t.scrapePool} instance=${t.instance} health=${t.health}`,
-          );
-        }
 
-        const configResult = await sshExecRaw(
-          sshHost,
-          sshUser,
+        const configResult = await sshExec(
+          host,
+          user,
           `docker exec prometheus wget -qO- http://localhost:9090/api/v1/status/config`,
         );
-        const configJson = JSON.parse(configResult.stdout);
-        const scrapeConfigsYaml = configJson.data?.yaml || "";
+        const configJson = parsePromApi(
+          "inspect /api/v1/status/config",
+          configResult.stdout,
+        ) as { data?: { yaml?: unknown } };
+        const scrapeConfigsYaml = typeof configJson.data?.yaml === "string"
+          ? configJson.data.yaml
+          : "";
+
+        log.info("Found {count} active targets across jobs {jobs}", {
+          count: activeTargets.length,
+          jobs,
+        });
 
         const handle = await context.writeResource("inspect", "inspect", {
           jobs,
@@ -257,19 +482,25 @@ export const model: {
       description:
         "Send SIGHUP to the prometheus container to reload its config",
       arguments: ReloadArgs,
-      execute: async (_args, context) => {
-        const { sshHost, sshUser = "keeb" } = context.globalArgs;
+      execute: async (
+        _args: z.infer<typeof ReloadArgs>,
+        context: HubContext,
+      ) => {
+        const { host, user } = sshTarget(context);
+        context.logger.info("Sending SIGHUP to prometheus on {host}", { host });
         const result = await sshExecRaw(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `docker kill -s HUP prometheus`,
         );
         if (result.code !== 0) {
           throw new Error(
-            `SIGHUP failed: ${result.stderr || result.stdout}`,
+            `SIGHUP to prometheus on ${host} failed (exit ${result.code}): ${
+              result.stderr || result.stdout
+            }`,
           );
         }
-        console.log(`[reload] SIGHUP sent to prometheus`);
+        context.logger.info("SIGHUP sent to prometheus");
         return { dataHandles: [] };
       },
     },
@@ -277,67 +508,41 @@ export const model: {
       description:
         "Remove a scrape_config block from the live prometheus.yml and reload",
       arguments: RemoveScrapeJobArgs,
-      execute: async (args, context) => {
-        const { jobName } = args;
-        const { sshHost, sshUser = "keeb" } = context.globalArgs;
+      execute: async (
+        args: z.infer<typeof RemoveScrapeJobArgs>,
+        context: HubContext,
+      ) => {
+        const { jobName } = RemoveScrapeJobArgs.parse(args);
+        const { host, user } = sshTarget(context);
+        const log = context.logger;
 
-        if (!jobName) throw new Error("jobName is required");
-
-        console.log(`[removeScrapeJob] Locating prometheus.yml on ${sshHost}`);
-        const inspectResult = await sshExecRaw(
-          sshHost,
-          sshUser,
+        log.info("Removing scrape job {jobName} on {host}", { jobName, host });
+        const inspectResult = await sshExec(
+          host,
+          user,
           `docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/prometheus/prometheus.yml"}}{{.Source}}{{end}}{{end}}' prometheus`,
         );
         const configPath = inspectResult.stdout.trim();
         if (!configPath) {
           throw new Error(
-            "Could not locate prometheus.yml bind mount on host",
+            `Could not locate the prometheus.yml bind mount of the prometheus container on ${host}`,
           );
         }
-        console.log(`[removeScrapeJob] Config file: ${configPath}`);
+        assertAbsPath("prometheus.yml bind-mount source", configPath);
+        const qConfig = shellQuote(configPath);
+        log.info("Config file: {configPath}", { configPath });
 
-        const readResult = await sshExecRaw(
-          sshHost,
-          sshUser,
-          `cat ${configPath}`,
+        const readResult = await sshExec(host, user, `cat ${qConfig}`);
+        const { yaml: newYaml, removed } = removeJobBlock(
+          readResult.stdout,
+          jobName,
         );
-        const yamlContent = readResult.stdout;
-
-        const lines = yamlContent.split("\n");
-        const out = [];
-        let skipping = false;
-        let blockIndent = 0;
-        let removed = false;
-        const escaped = jobName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const startRe = new RegExp(
-          `^(\\s*)-\\s+job_name:\\s*["']?${escaped}["']?\\s*$`,
-        );
-
-        for (const line of lines) {
-          if (!skipping) {
-            const m = line.match(startRe);
-            if (m) {
-              blockIndent = m[1].length;
-              skipping = true;
-              removed = true;
-              continue;
-            }
-            out.push(line);
-          } else {
-            const trimmed = line.trim();
-            if (trimmed === "" || trimmed.startsWith("#")) continue;
-            const lstrip = line.length - line.trimStart().length;
-            if (lstrip > blockIndent) continue;
-            skipping = false;
-            out.push(line);
-          }
-        }
 
         if (!removed) {
-          console.log(
-            `[removeScrapeJob] No job_name '${jobName}' found in ${configPath}`,
-          );
+          log.info("No job_name {jobName} found in {configPath}", {
+            jobName,
+            configPath,
+          });
           const handle = await context.writeResource(
             "removeScrapeJob",
             jobName,
@@ -352,55 +557,49 @@ export const model: {
           return { dataHandles: [handle] };
         }
 
-        const newYaml = out.join("\n");
         const backupPath = `${configPath}.bak.${Date.now()}`;
-        console.log(`[removeScrapeJob] Backup: ${backupPath}`);
-        await sshExec(sshHost, sshUser, `cp ${configPath} ${backupPath}`);
+        const qBackup = shellQuote(backupPath);
+        log.info("Backing up config to {backupPath}", { backupPath });
+        await sshExec(host, user, `cp ${qConfig} ${qBackup}`);
 
         // Truncate-write in place — single-file Docker bind mounts break if we
         // swap the inode via mv (the container holds a reference to the old
         // inode and never sees the new file).
-        const b64 = btoa(unescape(encodeURIComponent(newYaml)));
         await sshExec(
-          sshHost,
-          sshUser,
-          `echo '${b64}' | base64 -d > ${configPath}`,
+          host,
+          user,
+          `echo '${toBase64(newYaml)}' | base64 -d > ${qConfig}`,
         );
-        console.log(
-          `[removeScrapeJob] Wrote new prometheus.yml (truncate-write, preserves inode)`,
-        );
+        log.info("Wrote new prometheus.yml (truncate-write, preserves inode)");
 
-        console.log(`[removeScrapeJob] Validating with promtool`);
         const validateResult = await sshExecRaw(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `docker exec prometheus promtool check config /etc/prometheus/prometheus.yml`,
         );
         if (validateResult.code !== 0) {
-          console.log(`[removeScrapeJob] promtool failed, restoring backup`);
-          await sshExec(sshHost, sshUser, `cp ${backupPath} ${configPath}`);
+          log.warning("promtool rejected the new config, restoring backup");
+          await sshExec(host, user, `cat ${qBackup} > ${qConfig}`);
           throw new Error(
             `promtool validation failed (backup restored): stdout=${validateResult.stdout} stderr=${validateResult.stderr}`,
           );
         }
-        console.log(`[removeScrapeJob] promtool ok`);
 
         const reloadResult = await sshExecRaw(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `docker kill -s HUP prometheus`,
         );
-        const reloaded = reloadResult.code === 0;
-        console.log(`[removeScrapeJob] SIGHUP exit=${reloadResult.code}`);
-        if (!reloaded) {
-          console.log(`[removeScrapeJob] Reload failed, restoring backup`);
-          await sshExec(sshHost, sshUser, `cp ${backupPath} ${configPath}`);
+        if (reloadResult.code !== 0) {
+          log.warning("Prometheus reload failed, restoring backup");
+          await sshExec(host, user, `cat ${qBackup} > ${qConfig}`);
           throw new Error(
             `prometheus reload failed (backup restored): ${
               reloadResult.stderr || reloadResult.stdout
             }`,
           );
         }
+        log.info("Removed job {jobName} and reloaded prometheus", { jobName });
 
         const handle = await context.writeResource(
           "removeScrapeJob",
@@ -409,7 +608,7 @@ export const model: {
             jobName,
             configPath,
             removed: true,
-            reloaded,
+            reloaded: true,
             timestamp: new Date().toISOString(),
           },
         );

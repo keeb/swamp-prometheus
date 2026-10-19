@@ -45,7 +45,10 @@ function collectSchemas(model: any): [label: string, schema: AnySchema][] {
 const modelsDir = new URL("../../extensions/models/", import.meta.url);
 const modelFiles: string[] = [];
 for await (const entry of Deno.readDir(modelsDir)) {
-  if (entry.isFile && entry.name.endsWith(".ts")) modelFiles.push(entry.name);
+  if (
+    entry.isFile && entry.name.endsWith(".ts") &&
+    !entry.name.endsWith("_test.ts")
+  ) modelFiles.push(entry.name);
 }
 modelFiles.sort();
 

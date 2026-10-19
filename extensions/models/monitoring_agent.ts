@@ -2,10 +2,14 @@
  * @keeb/monitoring/agent model — install and configure node_exporter and
  * promtail on a remote Alpine VM, and enable the node_exporter textfile
  * collector for custom .prom metrics.
+ *
+ * All remote work runs over SSH (see lib/ssh.ts). Every value interpolated
+ * into a remote command or the generated promtail config is validated by the
+ * argument schemas below.
  */
 import { z } from "npm:zod@4";
-import { sshExec } from "./lib/ssh.ts";
-import { isValidSshHost } from "./lib/ssh.ts";
+import { assertSshTarget, sshExec } from "./lib/ssh.ts";
+import { HTTP_URL_RE, VmName } from "./lib/validate.ts";
 
 const GlobalArgs = z.object({
   sshHost: z.string().describe("SSH hostname/IP of the target VM"),
@@ -13,13 +17,16 @@ const GlobalArgs = z.object({
 });
 
 const InstallArgs = z.object({
-  vmName: z.string().describe("VM name (used for resource naming)"),
+  vmName: VmName.describe("VM name (used for resource naming)"),
 });
 
 const ConfigureArgs = z.object({
-  vmName: z.string().describe("VM name (used as host label in promtail)"),
-  lokiUrl: z.string().describe(
-    "Loki push URL (e.g. http://10.0.0.12:3100/loki/api/v1/push)",
+  vmName: VmName.describe("VM name (used as host label in promtail)"),
+  lokiUrl: z.string().regex(
+    HTTP_URL_RE,
+    "lokiUrl must be an http(s) URL without whitespace, quotes or shell characters",
+  ).describe(
+    "Loki push URL (e.g. http://192.0.2.12:3100/loki/api/v1/push)",
   ),
 });
 
@@ -40,7 +47,30 @@ const TextfileSchema = z.object({
   timestamp: z.string(),
 });
 
-function promtailConfig(lokiUrl, vmName) {
+type GlobalArgsT = z.infer<typeof GlobalArgs>;
+
+/** The subset of the swamp method context this model uses. */
+interface AgentContext {
+  globalArgs: GlobalArgsT;
+  logger: {
+    info: (message: string, props?: Record<string, unknown>) => void;
+  };
+  writeResource: (
+    spec: string,
+    name: string,
+    data: Record<string, unknown>,
+  ) => Promise<unknown>;
+}
+
+/** Resolves and validates the SSH target from global arguments. */
+function sshTarget(context: AgentContext): { host: string; user: string } {
+  const { sshHost, sshUser = "root" } = context.globalArgs;
+  assertSshTarget(sshHost, sshUser);
+  return { host: sshHost, user: sshUser };
+}
+
+/** Renders the promtail config pushing syslog and /var/log/*.log to Loki. */
+export function promtailConfig(lokiUrl: string, vmName: string): string {
   return `server:
   http_listen_port: 9080
   grpc_listen_port: 0
@@ -70,89 +100,107 @@ scrape_configs:
 }
 
 /** Swamp model definition for `@keeb/monitoring/agent`. */
-export const model: {
-  type: string;
-  version: string;
-  resources: Record<string, unknown>;
-  globalArguments: typeof GlobalArgs;
-  methods: Record<string, unknown>;
-} = {
+export const model = {
   type: "@keeb/monitoring/agent",
   version: "2026.02.17.1",
   resources: {
     "install": {
       description: "Monitoring agent install state",
       schema: InstallSchema,
-      lifetime: "infinite",
+      lifetime: "infinite" as const,
       garbageCollection: 10,
     },
     "config": {
       description: "Monitoring agent configuration state",
       schema: ConfigSchema,
-      lifetime: "infinite",
+      lifetime: "infinite" as const,
       garbageCollection: 10,
     },
     "textfile": {
       description: "Textfile collector setup state",
       schema: TextfileSchema,
-      lifetime: "infinite",
+      lifetime: "infinite" as const,
       garbageCollection: 10,
     },
   },
   globalArguments: GlobalArgs,
+  upgrades: [
+    {
+      toVersion: "2026.02.17.1",
+      description: "Baseline version, no globalArguments schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
+  checks: {
+    "valid-ssh-target": {
+      description:
+        "sshHost is a plain hostname/IP (VM has an address) and sshUser a plain user name",
+      labels: ["policy"],
+      execute: (
+        context: { globalArgs: GlobalArgsT },
+      ): Promise<{ pass: boolean; errors?: string[] }> => {
+        const { sshHost, sshUser = "root" } = context.globalArgs;
+        try {
+          assertSshTarget(sshHost, sshUser);
+          return Promise.resolve({ pass: true });
+        } catch (e) {
+          return Promise.resolve({
+            pass: false,
+            errors: [(e as Error).message],
+          });
+        }
+      },
+    },
+  },
   methods: {
     install: {
       description:
         "Install node-exporter and promtail binary on an Alpine VM (no configuration)",
       arguments: InstallArgs,
-      execute: async (args, context) => {
-        const { vmName } = args;
-        const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) {
-          throw new Error(
-            "sshHost is required — VM must be running with an IP",
-          );
-        }
+      execute: async (
+        args: z.infer<typeof InstallArgs>,
+        context: AgentContext,
+      ) => {
+        const { vmName } = InstallArgs.parse(args);
+        const { host, user } = sshTarget(context);
+        const log = context.logger;
 
-        console.log(
-          `[install] Installing monitoring agents on ${sshHost} (${vmName})`,
-        );
+        log.info("Installing monitoring agents on {host} ({vmName})", {
+          host,
+          vmName,
+        });
 
-        // Enable community repo (idempotent)
-        console.log(`[install] Enabling Alpine community repo`);
+        log.info("Enabling Alpine community repo");
         await sshExec(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `sed -i '/^#.*\\/community$/s/^#//' /etc/apk/repositories && apk update`,
         );
 
-        // Install and start node-exporter
-        console.log(`[install] Installing node-exporter`);
+        log.info("Installing node-exporter");
         await sshExec(
-          sshHost,
-          sshUser,
-          `apk add prometheus-node-exporter && rc-update add node-exporter default && service node-exporter start`,
+          host,
+          user,
+          `apk add prometheus-node-exporter && { rc-update add node-exporter default 2>/dev/null || true; } && { service node-exporter status >/dev/null 2>&1 || service node-exporter start; }`,
         );
 
-        // Verify node-exporter responds
-        console.log(`[install] Verifying node-exporter on :9100`);
+        log.info("Verifying node-exporter on :9100");
         await sshExec(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `wget -qO /dev/null http://localhost:9100/metrics`,
         );
-        console.log(`[install] node-exporter responding`);
 
-        // Install native promtail package (community repo already enabled above)
-        console.log(`[install] Installing promtail via apk`);
+        log.info("Installing promtail via apk");
+        await sshExec(host, user, `apk add loki-promtail loki-promtail-openrc`);
         await sshExec(
-          sshHost,
-          sshUser,
-          `apk add loki-promtail loki-promtail-openrc`,
+          host,
+          user,
+          `rc-update add loki-promtail default 2>/dev/null || true`,
         );
-        await sshExec(sshHost, sshUser, `rc-update add loki-promtail default`);
-        console.log(
-          `[install] promtail installed (service not started — no config yet)`,
+        log.info(
+          "Installed node-exporter (running) and promtail (not started, no config yet) on {vmName}",
+          { vmName },
         );
 
         const handle = await context.writeResource("install", vmName, {
@@ -167,56 +215,55 @@ export const model: {
       description:
         "Configure promtail to push logs to Loki and start the service",
       arguments: ConfigureArgs,
-      execute: async (args, context) => {
-        const { vmName, lokiUrl } = args;
-        const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) {
-          throw new Error(
-            "sshHost is required — VM must be running with an IP",
-          );
-        }
+      execute: async (
+        args: z.infer<typeof ConfigureArgs>,
+        context: AgentContext,
+      ) => {
+        const { vmName, lokiUrl } = ConfigureArgs.parse(args);
+        const { host, user } = sshTarget(context);
+        const log = context.logger;
 
-        console.log(
-          `[configure] Configuring promtail on ${sshHost} (${vmName}) → ${lokiUrl}`,
-        );
+        log.info("Configuring promtail on {host} ({vmName}) -> {lokiUrl}", {
+          host,
+          vmName,
+          lokiUrl,
+        });
 
-        // Write promtail config
         const config = promtailConfig(lokiUrl, vmName);
-        await sshExec(sshHost, sshUser, `mkdir -p /etc/loki /var/lib/promtail`);
+        await sshExec(host, user, `mkdir -p /etc/loki /var/lib/promtail`);
         await sshExec(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `cat > /etc/loki/promtail-local-config.yaml << 'EOF'\n${config}EOF`,
         );
-        console.log(`[configure] Wrote /etc/loki/promtail-local-config.yaml`);
+        log.info("Wrote /etc/loki/promtail-local-config.yaml");
 
         // Stop old Docker container if somehow present (idempotent cleanup)
         await sshExec(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `docker stop promtail 2>/dev/null || true && docker rm promtail 2>/dev/null || true`,
         );
 
-        // Ensure promtail is installed (idempotent — handles configure-monitoring without prior install)
+        // Ensure promtail is installed (idempotent — handles configure without prior install)
         await sshExec(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `apk info -e loki-promtail >/dev/null 2>&1 || apk add loki-promtail loki-promtail-openrc`,
         );
 
-        // Enable + start/restart native service
-        console.log(`[configure] Starting native promtail service`);
+        log.info("Starting native promtail service");
         await sshExec(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `rc-update add loki-promtail default 2>/dev/null || true`,
         );
         await sshExec(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `service loki-promtail restart 2>/dev/null || service loki-promtail start`,
         );
-        console.log(`[configure] promtail service running`);
+        log.info("promtail service running on {vmName}", { vmName });
 
         const handle = await context.writeResource("config", vmName, {
           lokiUrl,
@@ -230,50 +277,44 @@ export const model: {
       description:
         "Enable node-exporter textfile collector for custom .prom metrics (one-time setup)",
       arguments: InstallArgs,
-      execute: async (args, context) => {
-        const { vmName } = args;
-        const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) {
-          throw new Error(
-            "sshHost is required — VM must be running with an IP",
-          );
-        }
+      execute: async (
+        args: z.infer<typeof InstallArgs>,
+        context: AgentContext,
+      ) => {
+        const { vmName } = InstallArgs.parse(args);
+        const { host, user } = sshTarget(context);
+        const log = context.logger;
 
-        console.log(
-          `[enableTextfileCollector] Setting up textfile collector on ${sshHost} (${vmName})`,
-        );
+        log.info("Setting up textfile collector on {host} ({vmName})", {
+          host,
+          vmName,
+        });
 
-        // Create textfile collector directory
         await sshExec(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `mkdir -p /var/lib/node_exporter/textfile_collector`,
         );
 
-        // Add textfile collector flag to node-exporter config (idempotent)
-        console.log(
-          `[enableTextfileCollector] Configuring node-exporter textfile directory`,
-        );
+        log.info("Configuring node-exporter textfile directory");
         await sshExec(
-          sshHost,
-          sshUser,
+          host,
+          user,
           [
             `grep -q 'textfile.directory' /etc/conf.d/node-exporter 2>/dev/null`,
             `|| echo 'ARGS="--collector.textfile.directory=/var/lib/node_exporter/textfile_collector"' >> /etc/conf.d/node-exporter`,
           ].join(" "),
         );
 
-        // Restart node-exporter to pick up config
-        console.log(`[enableTextfileCollector] Restarting node-exporter`);
-        await sshExec(sshHost, sshUser, `service node-exporter restart`);
+        log.info("Restarting node-exporter");
+        await sshExec(host, user, `service node-exporter restart`);
 
-        // Verify textfile collector works
         await sshExec(
-          sshHost,
-          sshUser,
+          host,
+          user,
           `wget -qO- http://localhost:9100/metrics | grep -q 'node_textfile_scrape_error' && echo ok`,
         );
-        console.log(`[enableTextfileCollector] Textfile collector enabled`);
+        log.info("Textfile collector enabled on {vmName}", { vmName });
 
         const handle = await context.writeResource("textfile", vmName, {
           textfileCollectorEnabled: true,

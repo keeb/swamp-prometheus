@@ -1,6 +1,6 @@
 ---
 name: prometheus
-description: Install and wire monitoring agents (node_exporter, promtail) on remote Alpine VMs over SSH and register VMs as Prometheus scrape targets via file_sd_configs from swamp workflows. Provides the @user/monitoring/agent and @user/monitoring/hub models from @keeb/prometheus. Use when setting up host metrics collection, shipping logs to Loki, registering Prometheus targets, enabling the node_exporter textfile collector for custom .prom metrics, or wiring observability into automation. Triggers on "prometheus", "node_exporter", "node-exporter", "promtail", "loki", "monitoring agent", "scrape target", "file_sd_configs", "textfile collector", "@keeb/prometheus", "@user/monitoring/agent", "@user/monitoring/hub", "setup-monitoring", "configure-monitoring", "setup-game-metrics".
+description: Install and wire monitoring agents (node_exporter, promtail) on remote Alpine VMs over SSH and register VMs as Prometheus scrape targets via file_sd_configs from swamp workflows. Provides the @keeb/monitoring/agent and @keeb/monitoring/hub models from @keeb/prometheus. Use when setting up host metrics collection, shipping logs to Loki, registering Prometheus targets, enabling the node_exporter textfile collector for custom .prom metrics, or wiring observability into automation. Triggers on "prometheus", "node_exporter", "node-exporter", "promtail", "loki", "monitoring agent", "scrape target", "file_sd_configs", "textfile collector", "@keeb/prometheus", "@keeb/monitoring/agent", "@keeb/monitoring/hub", "setup-monitoring", "configure-monitoring", "setup-game-metrics".
 ---
 
 # @keeb/prometheus
@@ -12,7 +12,7 @@ helper module — no model wiring required).
 
 ## Models
 
-### `@user/monitoring/agent`
+### `@keeb/monitoring/agent`
 
 Installs and configures `node_exporter` (host metrics on `:9100`) and `promtail`
 (log shipper to Loki) on a remote Alpine VM. All operations run over SSH and
@@ -46,7 +46,7 @@ metrics across labels.
 | `config`   | infinite | 10 | `lokiUrl`, `promtailConfigured`, `timestamp`            |
 | `textfile` | infinite | 10 | `textfileCollectorEnabled`, `timestamp`                 |
 
-### `@user/monitoring/hub`
+### `@keeb/monitoring/hub`
 
 Talks to a central monitoring hub host that runs Prometheus + Loki. Uses
 Prometheus' `file_sd_configs` so registration is just writing a JSON file into a
@@ -66,6 +66,9 @@ directory the Prometheus container watches — no API call, no reload.
 | ---------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `discover` | (none)               | `curl`s `localhost:3100/ready` for Loki and `docker exec prometheus wget -qO- /-/ready` for Prometheus, then writes the hub endpoints into a resource |
 | `register` | `vmName`, `targetIp` | Writes `${targetsDir}/${vmName}.json` containing one target on `:9100` with labels `instance=vmName, job=node`. Prometheus auto-picks it up in ~15s   |
+| `inspect`  | (none)               | Reads `/api/v1/targets` and `/api/v1/status/config` via `docker exec prometheus wget` and records active targets, job names and the live config YAML |
+| `reload`   | (none)               | Sends SIGHUP to the `prometheus` container                                                                                                            |
+| `removeScrapeJob` | `jobName`     | Backs up the bind-mounted `prometheus.yml`, removes the `- job_name: <jobName>` block in place, validates with `promtool`, reloads; restores the backup on failure |
 
 `discover` derives `lokiPushUrl = http://${sshHost}:3100/loki/api/v1/push` and
 `prometheusUrl = http://${sshHost}:9090` from `sshHost`. Downstream steps that
@@ -82,21 +85,21 @@ need the Loki URL should pull it from this resource rather than hardcoding.
 
 ```yaml
 # definition.yaml — agent instance per target VM
-type: "@user/monitoring/agent"
+type: "@keeb/monitoring/agent"
 name: monitoringAgent
 globalArguments:
-  sshHost: 10.0.0.225
+  sshHost: 192.0.2.25
   sshUser: root
 ```
 
 ```yaml
 # definition.yaml — one hub instance for the central Prometheus/Loki host
-type: "@user/monitoring/hub"
+type: "@keeb/monitoring/hub"
 name: hancockMonitoring
 globalArguments:
-  sshHost: 10.0.0.12
+  sshHost: 198.51.100.12
   sshUser: keeb
-  targetsDir: /storage/02/linux/docker/prometheus/targets
+  targetsDir: /srv/prometheus/targets
 ```
 
 `sshHost` for the agent is typically not known until a VM has been provisioned —
@@ -130,8 +133,9 @@ swamp workflow run setup-monitoring --input vmName=infinity
 
 The bundled workflows demonstrate this — the agent's `sshHost` is left unset in
 the definition and overridden per-run by data from an upstream `fleet` model. If
-`sshHost` is missing or literally the string `"null"` / `"undefined"`, every
-method throws `sshHost is required — VM must be running with an IP`.
+`sshHost` is missing, literally the string `"null"` / `"undefined"`, or not a
+plain hostname/IP, every method throws `Invalid sshHost ...` before running
+`ssh`.
 
 ### Pull `lokiUrl` from the hub's `discover` output
 
@@ -166,9 +170,12 @@ HTTP.
   `service`). Anything Debian/Ubuntu/RHEL will fail. The promtail package is
   `loki-promtail` from the Alpine community repo — `install` enables that repo
   for you.
-- **`sshHost` validation is intentionally loose.** Only `null`, `undefined`,
-  empty strings, and non-strings are rejected. A typo'd hostname will get all
-  the way to `ssh` and fail there with a less friendly error.
+- **Inputs are validated before any `ssh` call.** `sshHost` must be a
+  hostname or IP literal and `sshUser` a plain user name (neither may start
+  with `-`). `vmName` is limited to letters, digits, `.`, `_`, `-`; `lokiUrl`
+  must be an http(s) URL without whitespace, quotes or shell characters;
+  `targetIp` must be a hostname, IPv4 or `[IPv6]` literal; `targetsDir` must be
+  absolute. A typo'd but well-formed hostname still fails inside `ssh`.
 - **SSH uses `StrictHostKeyChecking=no` and `UserKnownHostsFile=/dev/null`.**
   Fine for ephemeral VMs in a trusted network; do NOT point these models at
   hosts on an untrusted network without changing the helper.

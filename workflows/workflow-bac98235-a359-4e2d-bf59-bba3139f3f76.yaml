@@ -19,7 +19,7 @@ jobs:
         dependsOn: []
         weight: 0
       - name: discover-hub
-        description: Validate observability stack on hancock
+        description: Validate observability stack on the monitoring hub
         task:
           type: model_method
           modelIdOrName: hancockMonitoring
@@ -69,7 +69,7 @@ jobs:
               type: succeeded
         weight: 0
       - name: register-target
-        description: Register VM as a Prometheus scrape target on hancock
+        description: Register VM as a Prometheus scrape target on the monitoring hub
         task:
           type: model_method
           modelIdOrName: hancockMonitoring
